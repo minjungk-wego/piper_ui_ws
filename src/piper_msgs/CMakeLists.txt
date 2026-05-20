@@ -11,10 +11,17 @@ find_package(rclpy REQUIRED)
 
 find_package(rosidl_default_generators REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
-  "msg/PiperStatusMsg.msg"  
+  "msg/PiperStatusMsg.msg"
   "msg/PosCmd.msg"
+  "msg/PiperState.msg"
   "srv/Enable.srv"
-  DEPENDENCIES # Add packages that above messages depend on, in this case geometry_msgs for Sphere.msg
+  "srv/SavePose.srv"
+  "srv/ListPoses.srv"
+  "srv/DeletePose.srv"
+  "srv/JogJoint.srv"
+  "action/PiperMacro.action"
+  "action/GotoPose.action"
+  DEPENDENCIES action_msgs
 )
 
 if(BUILD_TESTING)

@@ -320,8 +320,8 @@ def main():
                     hold_btn('Z-', 'z', -1, False, '#1d4ed8', 'down')
                 dpad('X+', 'x', +1, '#dc2626',
                      'X-', 'x', -1, '#dc2626',
-                     'Y-', 'y', -1, '#16a34a',
-                     'Y+', 'y', +1, '#16a34a', False)
+                     'Y+', 'y', +1, '#16a34a',
+                     'Y-', 'y', -1, '#16a34a', False)
 
             # TCP 자세
             with ui.card().classes('w-full').style(CARD):

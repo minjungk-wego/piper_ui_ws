@@ -1,0 +1,11 @@
+# Goal
+string name
+string category
+float64 speed
+---
+# Result
+bool success
+string message
+---
+# Feedback
+float64[] current_joints
