@@ -28,20 +28,23 @@ _latest_jpeg = None
 
 class _MJPEGHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        # iOS Safari는 multipart/x-mixed-replace MJPEG를 <img>에서 렌더링 못 함.
+        # 모든 경로에서 단일 JPEG 프레임만 반환 → 클라이언트가 폴링.
+        with _frame_lock:
+            data = _latest_jpeg
+        if not data:
+            self.send_response(503)
+            self.end_headers()
+            return
         self.send_response(200)
-        self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
-        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Content-Type', 'image/jpeg')
+        self.send_header('Content-Length', str(len(data)))
+        self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+        self.send_header('Pragma', 'no-cache')
+        self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         try:
-            while True:
-                with _frame_lock:
-                    data = _latest_jpeg
-                if data:
-                    self.wfile.write(
-                        b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + data + b'\r\n'
-                    )
-                    self.wfile.flush()
-                _time.sleep(0.05)
+            self.wfile.write(data)
         except Exception:
             pass
 
@@ -353,8 +356,24 @@ def main():
                     'background:#000; border:none; border-radius:8px'):
                 _host = request.headers.get('host', '').split(':')[0]
                 ui.html(
-                    f'<img src="http://{_host}:8081/"'
+                    f'<img id="cam" src="http://{_host}:8081/"'
                     ' style="width:100%; aspect-ratio:4/3; object-fit:contain; display:block; background:#000">'
+                )
+                ui.add_body_html(
+                    '<script>'
+                    '(function(){'
+                    f'  var base="http://{_host}:8081/";'
+                    '  function tick(){'
+                    '    var img=document.getElementById("cam");'
+                    '    if(!img){setTimeout(tick,200);return;}'
+                    '    var n=new Image();'
+                    '    n.onload=function(){img.src=n.src;setTimeout(tick,100);};'
+                    '    n.onerror=function(){setTimeout(tick,500);};'
+                    '    n.src=base+"?t="+Date.now();'
+                    '  }'
+                    '  tick();'
+                    '})();'
+                    '</script>'
                 )
 
             # 속도 슬라이더
@@ -454,7 +473,8 @@ def main():
                 with measurement_row:
                     pose_name_input = ui.input(placeholder='자세 이름') \
                         .classes('flex-1') \
-                        .style('background:#374151; color:white; border-radius:8px; padding:0 8px')
+                        .style('background:#374151; color:white !important; border-radius:8px; padding:0 8px') \
+                        .props('input-style="color: white"')
                     ui.button('현재 자세 저장', on_click=lambda: do_save_pose()) \
                         .classes('h-10 text-xs font-bold') \
                         .style('background:#16a34a; color:white; border-radius:8px; padding:0 12px')
