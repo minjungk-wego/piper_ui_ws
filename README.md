@@ -1,6 +1,16 @@
-# piper_web_ui
+# piper_ui_ws
 
-Piper 로봇팔을 스마트폰/브라우저에서 제어할 수 있는 모바일 웹 UI 패키지입니다.
+Piper 로봇팔을 스마트폰/브라우저에서 제어할 수 있는 모바일 웹 UI 워크스페이스입니다.
+
+---
+
+## 패키지 구성
+
+| 패키지 | 레포 | 설명 |
+|--------|------|------|
+| `piper_web_ui` | 본 레포 | 모바일 웹 UI 노드 |
+| `piper` (ctrl_node) | [radius-piper](https://github.com/WeGo-Robotics-dev/radius-piper) | Piper 하드웨어 제어 노드 |
+| `wego_msgs` | [radius-wego-msgs](https://github.com/WeGo-Robotics-dev/radius-wego-msgs) | 공용 메시지/서비스/액션 타입 |
 
 ---
 
@@ -10,10 +20,12 @@ Piper 로봇팔을 스마트폰/브라우저에서 제어할 수 있는 모바�
 - **TCP 위치 제어**: X / Y / Z 축 이동 (버튼 누르는 시간에 비례)
 - **TCP 자세 제어**: Rx / Ry / Rz 관절 제어 (joint 4 / 5 / 6)
 - **그리퍼 제어**: 열기 / 닫기
-- **속도 조절**: 슬라이더로 이동 속도 조절 (1~10단계)
+- **속도 조절**: 슬라이더로 이동 속도 조절
 - **E-STOP**: 즉시 정지 (잔류 토크 유지, 낙하 방지)
 - **복구**: E-STOP 이후 정상 상태 복구 (약 6초 소요)
-- **웨이포인트**: 위치 저장 및 순서 실행
+- **자세 저장/실행**: 현재 joint 각도를 이름과 함께 YAML에 저장, 저장된 자세로 이동
+  - 측정 자세 (`measurement`) — 자유 이름 지정
+  - Stow 자세 (`stow`) — `default` / `low` / `back_swept` 고정
 
 ---
 
@@ -29,26 +41,33 @@ Piper 로봇팔을 스마트폰/브라우저에서 제어할 수 있는 모바�
 pip install nicegui scipy
 ```
 
-### ROS2 패키지
-
-- `piper_msgs` — Piper 전용 메시지 타입
-- `piper` (ctrl_node) — Piper 하드웨어 제어 노드
-- 카메라 노드 — `/camera/camera/color/image_raw/compressed` 토픽을 퍼블리시하는 카메라 드라이버 필요
-
 ---
 
-## 빌드
+## 설치
 
-의존성 패키지 일괄 설치:
+### 1. 워크스페이스 생성
+
+```bash
+mkdir -p ~/piper_ui_ws/src
+cd ~/piper_ui_ws/src
+```
+
+### 2. 패키지 clone
+
+```bash
+# 본 레포
+git clone https://github.com/WeGo-Robotics-Daegu/piper_ui_ws.git
+cd piper_ui_ws
+
+# 의존 패키지
+git clone https://github.com/WeGo-Robotics-dev/radius-wego-msgs.git
+git clone -b min https://github.com/WeGo-Robotics-dev/radius-piper.git
+```
+
+### 3. 빌드
 
 ```bash
 cd ~/piper_ui_ws
-rosdep install --from-paths src --ignore-src -r -y
-```
-
-빌드:
-
-```bash
 colcon build --symlink-install
 source install/setup.bash
 ```
@@ -57,20 +76,17 @@ source install/setup.bash
 
 ## 실행 방법
 
-### 1. 카메라 노드 실행 (선택 사항)
+### 1. CAN 활성화
 
-카메라가 없어도 로봇 제어는 정상적으로 사용 가능합니다.
-
-카메라를 사용할 경우 카메라 노드를 실행합니다. 현재 설정된 토픽명은 다음과 같으며, 사용하는 카메라에 따라 `src/piper_web_ui/piper_web_ui/web_ui_node.py` 에서 아래 부분을 수정하여 변경할 수 있습니다:
-
-```python
-self.create_subscription(CompressedImage, '/camera/camera/color/image_raw/compressed', self._on_camera, 1)
+```bash
+cd ~/piper_ui_ws
+bash can_activate.sh
 ```
 
 ### 2. Piper ctrl_node 실행
 
 ```bash
-ros2 launch piper ctrl_node.launch.py
+ros2 launch piper start_single_piper.launch.py
 ```
 
 ### 3. Web UI 노드 실행
@@ -80,8 +96,6 @@ ros2 run piper_web_ui web_ui_node
 ```
 
 ### 4. 브라우저 접속
-
-스마트폰 또는 PC 브라우저에서 접속:
 
 ```
 http://<로봇_IP>:8080
@@ -107,10 +121,28 @@ http://<로봇_IP>:8080
 
 ---
 
-## 웨이포인트 사용
+## 자세 저장 사용
 
-1. 원하는 위치로 로봇 이동
-2. **현재 위치 저장** 버튼으로 웨이포인트 추가
-3. 대기 시간 설정 후 **순서 실행** 버튼으로 자동 이동
+### 측정 자세
+1. 원하는 자세로 팔 이동
+2. **자세 저장** 섹션 → **측정 자세** 탭 선택
+3. 이름 입력 후 **현재 자세 저장**
+4. 저장된 자세 옆 **실행** 버튼으로 해당 자세로 이동
 
-웨이포인트는 `~/piper_ui_ws/waypoints.json`에 저장됩니다.
+저장 위치: `~/piper_poses/measurement_poses.yaml`
+
+### Stow 자세
+1. 원하는 stow 자세로 팔 이동
+2. **자세 저장** 섹션 → **Stow 자세** 탭 선택
+3. `default` / `low` / `back_swept` 중 선택 후 **현재 자세 저장**
+4. 저장된 자세 옆 **실행** 버튼으로 stow 동작 실행
+
+저장 위치: `~/piper_poses/stow_poses.yaml`
+
+> **주의**: `stow_poses.yaml`에 `default` 항목이 없으면 ctrl_node가 시작되지 않습니다.
+
+---
+
+## ROS2 인터페이스
+
+상세 내용은 [PIPER_INTERFACES.md](PIPER_INTERFACES.md) 참조.

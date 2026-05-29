@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import asyncio
-import json
 import math
 import threading
 from pathlib import Path
@@ -14,14 +13,14 @@ from fastapi import Request
 from geometry_msgs.msg import Pose
 from nicegui import app as nicegui_app
 from nicegui import ui
-from piper_msgs.msg import PosCmd
+from wego_msgs.action import GotoPose, PiperMacro
+from wego_msgs.msg import PosCmd
+from wego_msgs.srv import DeletePose, ListPoses, SavePose
+from rclpy.action import ActionClient
 from rclpy.node import Node
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import CompressedImage, JointState
 from std_msgs.msg import Bool
-
-
-WAYPOINTS_FILE = Path.home() / 'piper_ui_ws' / 'waypoints.json'
 
 _frame_lock = threading.Lock()
 _latest_jpeg = None
@@ -122,12 +121,18 @@ class WebUINode(Node):
         self.pos_pub     = self.create_publisher(PosCmd,       'pos_cmd',               1)
         self.enable_pub  = self.create_publisher(Bool,         'enable_flag',            1)
         self.init_pub    = self.create_publisher(Bool,         'init_pos',               1)
-        self.estop_pub   = self.create_publisher(Bool,         'estop',                  1)
+        self.estop_pub   = self.create_publisher(Bool,         '/safety/estop',           1)
         self.restore_pub = self.create_publisher(Bool,         'restore',                1)
-        self.joint_pub   = self.create_publisher(JointState,   'joint_states',           1)
+        self.joint_pub   = self.create_publisher(JointState,   '/piper/cmd_joints',       1)
         self.create_subscription(Pose,            'end_pose',             self._on_end_pose, 1)
-        self.create_subscription(JointState,      'joint_states_single',  self._on_joints,   1)
+        self.create_subscription(JointState,      '/piper/joint_states',  self._on_joints,   1)
         self.create_subscription(CompressedImage, '/camera/camera/color/image_raw/compressed', self._on_camera, 1)
+
+        self._save_pose_cli   = self.create_client(SavePose,   '/piper/save_pose')
+        self._list_poses_cli  = self.create_client(ListPoses,  '/piper/list_poses')
+        self._delete_pose_cli = self.create_client(DeletePose, '/piper/delete_pose')
+        self._goto_pose_cli   = ActionClient(self, GotoPose,   '/piper/goto_pose')
+        self._stow_cli        = ActionClient(self, PiperMacro, '/piper/stow')
 
     def _on_end_pose(self, msg: Pose):
         state.update_from_pose(msg)
@@ -182,19 +187,69 @@ class WebUINode(Node):
         m = Bool(); m.data = True
         self.restore_pub.publish(m)
 
+    def _call_sync(self, client, request, timeout=5.0):
+        future = client.call_async(request)
+        start = _time.time()
+        while not future.done() and _time.time() - start < timeout:
+            _time.sleep(0.01)
+        return future.result() if future.done() else None
 
-def _load_waypoints():
-    if WAYPOINTS_FILE.exists():
-        try:
-            return json.loads(WAYPOINTS_FILE.read_text())
-        except Exception:
-            return []
-    return []
+    def save_pose(self, name: str, category: str = 'measurement', overwrite: bool = True):
+        req = SavePose.Request()
+        req.name = name
+        req.category = category
+        req.overwrite = overwrite
+        return self._call_sync(self._save_pose_cli, req)
+
+    def list_poses(self, category: str = 'measurement'):
+        req = ListPoses.Request()
+        req.category = category
+        result = self._call_sync(self._list_poses_cli, req)
+        return result.names if result else []
+
+    def delete_pose(self, name: str, category: str = 'measurement'):
+        req = DeletePose.Request()
+        req.name = name
+        req.category = category
+        return self._call_sync(self._delete_pose_cli, req)
+
+    def execute_stow(self, pose_name: str = ''):
+        goal = PiperMacro.Goal()
+        goal.pose_name = pose_name
+        future = self._stow_cli.send_goal_async(goal)
+        start = _time.time()
+        while not future.done() and _time.time() - start < 5.0:
+            _time.sleep(0.01)
+        if not future.done():
+            return False
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            return False
+        result_future = goal_handle.get_result_async()
+        while not result_future.done() and _time.time() - start < 20.0:
+            _time.sleep(0.1)
+        return result_future.result().result.success if result_future.done() else False
+
+    def goto_pose(self, name: str, category: str = 'measurement', speed: float = 30.0):
+        goal = GotoPose.Goal()
+        goal.name = name
+        goal.category = category
+        goal.speed = speed
+        future = self._goto_pose_cli.send_goal_async(goal)
+        start = _time.time()
+        while not future.done() and _time.time() - start < 5.0:
+            _time.sleep(0.01)
+        if not future.done():
+            return False
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            return False
+        result_future = goal_handle.get_result_async()
+        while not result_future.done() and _time.time() - start < 35.0:
+            _time.sleep(0.1)
+        return result_future.result().result.success if result_future.done() else False
 
 
-def _save_waypoints(wps):
-    WAYPOINTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    WAYPOINTS_FILE.write_text(json.dumps(wps, indent=2))
 
 
 def main():
@@ -203,8 +258,6 @@ def main():
     _node = WebUINode()
     threading.Thread(target=rclpy.spin, args=(_node,), daemon=True).start()
     threading.Thread(target=_start_mjpeg_server, daemon=True).start()
-
-    waypoints = _load_waypoints()
 
     @ui.page('/')
     def index(request: Request):
@@ -378,70 +431,129 @@ def main():
                         .classes('flex-1 h-12 text-sm font-bold') \
                         .style('background-color:#16a34a !important; color:white !important; border-radius:8px')
 
-            # 웨이포인트
-            with ui.expansion('웨이포인트').classes('w-full text-white').style(
+            # 자세 저장
+            with ui.expansion('자세 저장').classes('w-full text-white').style(
                     'background:#1f2937; border:none; border-radius:8px'):
-                wp_container = ui.column().classes('w-full gap-1 mb-2')
 
-                def refresh_wp():
-                    wp_container.clear()
-                    with wp_container:
-                        if not waypoints:
-                            ui.label('저장된 웨이포인트가 없습니다') \
+                STOW_NAMES       = ['default', 'low', 'back_swept']
+                current_category = {'value': 'measurement'}
+
+                # 탭
+                with ui.row().classes('w-full gap-1 mb-2'):
+                    tab_m = ui.button('측정 자세') \
+                        .classes('flex-1 h-8 text-xs font-bold') \
+                        .style('background:#2563eb; color:white; border-radius:6px')
+                    tab_s = ui.button('Stow 자세') \
+                        .classes('flex-1 h-8 text-xs font-bold') \
+                        .style('background:#374151; color:white; border-radius:6px')
+
+                pose_container = ui.column().classes('w-full gap-1 mb-2')
+
+                # measurement용 입력 행
+                measurement_row = ui.row().classes('w-full gap-2 mb-2')
+                with measurement_row:
+                    pose_name_input = ui.input(placeholder='자세 이름') \
+                        .classes('flex-1') \
+                        .style('background:#374151; color:white; border-radius:8px; padding:0 8px')
+                    ui.button('현재 자세 저장', on_click=lambda: do_save_pose()) \
+                        .classes('h-10 text-xs font-bold') \
+                        .style('background:#16a34a; color:white; border-radius:8px; padding:0 12px')
+
+                # stow용 드롭다운 행
+                stow_row = ui.row().classes('w-full gap-2 mb-2').style('display:none')
+                with stow_row:
+                    stow_select = ui.select(STOW_NAMES, value='default') \
+                        .classes('flex-1') \
+                        .style('background:#374151; color:white; border-radius:8px')
+                    ui.button('현재 자세 저장', on_click=lambda: do_save_pose()) \
+                        .classes('h-10 text-xs font-bold') \
+                        .style('background:#16a34a; color:white; border-radius:8px; padding:0 12px')
+
+                def refresh_poses():
+                    pose_container.clear()
+                    cat = current_category['value']
+                    names = _node.list_poses(cat)
+                    with pose_container:
+                        if not names:
+                            ui.label('저장된 자세가 없습니다') \
                                 .classes('text-gray-500 text-xs py-1')
                             return
-                        for i, wp in enumerate(waypoints):
+                        for name in names:
                             with ui.row().classes('w-full items-center gap-2'):
-                                ui.label(
-                                    f'WP{i+1}  X:{wp[0]:+.0f}  Y:{wp[1]:+.0f}  Z:{wp[2]:+.0f}'
-                                ).classes('text-green-400 text-xs flex-1')
-                                ui.button('×', on_click=lambda idx=i: delete_wp(idx)) \
+                                ui.label(name).classes('text-green-400 text-xs flex-1')
+                                if cat == 'measurement':
+                                    ui.button('실행', on_click=lambda n=name: execute_pose(n)) \
+                                        .style(
+                                            'background:#2563eb; color:white; border-radius:4px;'
+                                            ' height:28px; min-width:0; padding:0 8px;'
+                                            ' font-size:12px; box-shadow:none'
+                                        )
+                                else:
+                                    ui.button('실행', on_click=lambda n=name: execute_stow_pose(n)) \
+                                        .style(
+                                            'background:#7c3aed; color:white; border-radius:4px;'
+                                            ' height:28px; min-width:0; padding:0 8px;'
+                                            ' font-size:12px; box-shadow:none'
+                                        )
+                                ui.button('×', on_click=lambda n=name: delete_pose(n)) \
                                     .style(
                                         'background:#dc2626; color:white; border-radius:4px;'
                                         ' width:28px; height:28px; min-width:0;'
                                         ' padding:0; font-size:14px; box-shadow:none'
                                     )
 
-                def save_wp():
-                    waypoints.append(list(state.snapshot()))
-                    _save_waypoints(waypoints)
-                    refresh_wp()
+                def switch_tab(cat):
+                    current_category['value'] = cat
+                    if cat == 'measurement':
+                        tab_m.style('background:#2563eb; color:white; border-radius:6px')
+                        tab_s.style('background:#374151; color:white; border-radius:6px')
+                        measurement_row.style('display:flex')
+                        stow_row.style('display:none')
+                    else:
+                        tab_m.style('background:#374151; color:white; border-radius:6px')
+                        tab_s.style('background:#2563eb; color:white; border-radius:6px')
+                        measurement_row.style('display:none')
+                        stow_row.style('display:flex')
+                    refresh_poses()
 
-                def delete_wp(idx):
-                    waypoints.pop(idx)
-                    _save_waypoints(waypoints)
-                    refresh_wp()
+                tab_m.on('click', lambda: switch_tab('measurement'))
+                tab_s.on('click', lambda: switch_tab('stow'))
 
-                def clear_wp():
-                    waypoints.clear()
-                    _save_waypoints(waypoints)
-                    refresh_wp()
+                def execute_pose(name):
+                    ui.notify(f"'{name}' 이동 중...", color='info')
+                    threading.Thread(
+                        target=lambda: _node.goto_pose(name, 'measurement'),
+                        daemon=True
+                    ).start()
 
-                async def execute_wp():
-                    delay = float(delay_input.value)
-                    for wp in list(waypoints):
-                        _node._publish(*wp)
-                        await asyncio.sleep(delay)
+                def execute_stow_pose(name):
+                    ui.notify(f"Stow '{name}' 실행 중...", color='info')
+                    threading.Thread(
+                        target=lambda: _node.execute_stow(name),
+                        daemon=True
+                    ).start()
 
-                with ui.row().classes('w-full gap-2 mb-2'):
-                    ui.button('현재 위치 저장', on_click=save_wp) \
-                        .classes('flex-1 h-10 text-xs font-bold') \
-                        .style('background:#16a34a; color:white; border-radius:8px')
-                    ui.button('전체 삭제', on_click=clear_wp) \
-                        .classes('h-10 text-xs font-bold') \
-                        .style('background:#374151; color:white; border-radius:8px; padding:0 12px')
+                def delete_pose(name):
+                    _node.delete_pose(name, current_category['value'])
+                    refresh_poses()
 
-                refresh_wp()
+                def do_save_pose():
+                    cat = current_category['value']
+                    name = stow_select.value if cat == 'stow' else pose_name_input.value.strip()
+                    if not name:
+                        ui.notify('자세 이름을 입력해주세요', color='negative')
+                        return
+                    result = _node.save_pose(name, cat, overwrite=True)
+                    if result and result.success:
+                        ui.notify(f"'{name}' 저장 완료", color='positive')
+                        if cat == 'measurement':
+                            pose_name_input.value = ''
+                        refresh_poses()
+                    else:
+                        msg = result.error_msg if result else '서비스 응답 없음'
+                        ui.notify(f"저장 실패: {msg}", color='negative')
 
-                with ui.row().classes('w-full items-center gap-2 mt-2'):
-                    ui.label('대기').classes('text-gray-400 text-xs')
-                    delay_input = ui.number(value=2.0, min=0.5, max=30.0, step=0.5, format='%.1f') \
-                        .classes('w-20') \
-                        .style('background:#374151; color:white; border-radius:4px')
-                    ui.label('초').classes('text-gray-400 text-xs')
-                    ui.button('순서 실행', on_click=execute_wp) \
-                        .classes('flex-1 h-10 text-xs font-bold') \
-                        .style('background:#7c3aed; color:white; border-radius:8px')
+                refresh_poses()
 
     ui.run(host='0.0.0.0', port=8080, title='Piper UI', reload=False)
 
